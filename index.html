@@ -22,8 +22,8 @@
   --green:#00d97e;
   --yellow:#ffd60a;
   --text:#f0ede8;
-  --t2:#898984;
-  --t3:#444440;
+  --t2:#c8c8c4;
+  --t3:#909090;
   --mono:'Courier New',Courier,monospace;
   --serif:Georgia,'Times New Roman',serif;
   --sans:-apple-system,'Helvetica Neue',Arial,sans-serif;
@@ -381,10 +381,11 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
       <span class="m-ttl" id="res-ttl">Select Pressing</span>
       <button class="m-close" onclick="closeModal('res-ov')">✕</button>
     </div>
-    <div style="padding:10px 16px 6px;border-bottom:1px solid var(--border);flex-shrink:0">
-      <input type="search" id="res-refine" class="srch" style="margin:0;font-size:14px"
-        placeholder="Not right? Type to refine search…"
+    <div style="padding:10px 16px 10px;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;gap:8px">
+      <input type="search" id="res-refine" class="srch" style="margin:0;font-size:14px;flex:1"
+        placeholder="Search by artist, title, label…"
         onkeydown="if(event.key==='Enter'){App.refineSearch(this.value);this.blur();}">
+      <button onclick="App.refineSearch(document.getElementById('res-refine').value)" style="flex-shrink:0;padding:0 16px;background:var(--red);border:none;border-radius:8px;color:#fff;font-size:14px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent">Go</button>
     </div>
     <div class="m-body" id="res-body"></div>
   </div>
@@ -400,6 +401,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
     </div>
     <div class="m-body" id="cf-body"></div>
     <div class="m-foot" id="cf-foot">
+      <button class="btn btn-s" id="cf-back" onclick="App.backToResults()" style="display:none">← Results</button>
       <button class="btn btn-s" onclick="closeModal('cf-ov');resetCfModal()">Cancel</button>
       <button class="btn btn-p" onclick="App.confirmAdd()">Add to Catalog</button>
     </div>
@@ -737,6 +739,7 @@ function closeModal(id){document.getElementById(id).classList.remove('on');}
 function resetCfModal(){
   document.getElementById('cf-title').textContent='Confirm & Add';
   document.getElementById('cf-foot').style.display='';
+  document.getElementById('cf-back').style.display='none';
 }
 function imgErr(el,cls){
   // Safe image fallback — avoids embedding HTML with > inside an onerror attribute
@@ -1024,13 +1027,23 @@ const App={
       this.cache=results;
       showDisc(false);
       setTx(q,false);
+      // Pre-fill the search bar with the spoken query always
+      const refine=document.getElementById('res-refine');
+      refine.value=q;
       if(!results.length){
-        toast('No results found — try rephrasing','er');
-        setTx('No results — try again',false);
+        // No results — open modal anyway so user can edit and retry
+        document.getElementById('res-ttl').textContent='No results — edit and search';
+        document.getElementById('res-body').innerHTML=`
+          <div class="empty">
+            <div class="empty-ico">🔍</div>
+            <div class="empty-ttl">Nothing found for "${esc(q)}"</div>
+            <div class="empty-sub">Edit the search above — try just the artist name, or check the spelling</div>
+          </div>`;
+        openModal('res-ov');
+        setTimeout(()=>refine.focus(),320);
         return;
       }
       this.renderResults(results,q);
-      document.getElementById('res-refine').value='';
       openModal('res-ov');
     }catch(e){
       showDisc(false);
@@ -1041,12 +1054,17 @@ const App={
 
   async refineSearch(q){
     q=q.trim(); if(!q) return;
+    document.getElementById('res-refine').value=q;
     const body=document.getElementById('res-body');
     body.innerHTML=`<div class="ld"><div class="spin"></div> Searching…</div>`;
     try{
       const results=await Discogs.search(q);
       this.cache=results;
-      document.getElementById('res-ttl').textContent=`"${q}" — ${results.length} pressings`;
+      document.getElementById('res-ttl').textContent=`"${q}" — ${results.length} result${results.length!==1?'s':''}`;
+      if(!results.length){
+        body.innerHTML=`<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No results for "${esc(q)}"</div><div class="empty-sub">Try just the artist name, or a single keyword</div></div>`;
+        return;
+      }
       this.renderResults(results,q);
     }catch(e){
       body.innerHTML=`<div class="empty"><div class="empty-ico">📡</div><div class="empty-ttl">Search failed</div><div class="empty-sub">Check connection and try again</div></div>`;
@@ -1112,12 +1130,25 @@ const App={
       const stat=statR.status==='fulfilled'?statR.value:null;
       showDisc(false);
       this.buildPending(rel,stat);
+      // Show ← Results back button
+      document.getElementById('cf-back').style.display='';
       openModal('cf-ov');
     }catch(e){
       showDisc(false);
       this.buildPending({...hit},null);
+      document.getElementById('cf-back').style.display='';
       openModal('cf-ov');
     }
+  },
+
+  backToResults(){
+    closeModal('cf-ov');
+    resetCfModal();
+    this.pending=null;
+    openModal('res-ov');
+    // Re-render the cached results list
+    const q=document.getElementById('res-refine').value||'Results';
+    this.renderResults(this.cache,q);
   },
 
   buildPending(rel,stat){
