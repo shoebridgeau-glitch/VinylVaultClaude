@@ -255,6 +255,11 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
         </div>
         <div class="transcript" id="tx">Ready to listen…</div>
         <div class="disc" id="disc"></div>
+        <div style="display:flex;gap:8px;width:100%">
+          <input type="search" id="home-search" class="srch" style="margin:0;flex:1;font-size:14px" placeholder="Or type artist &amp; title…"
+            onkeydown="if(event.key==='Enter'){App.search(this.value);this.blur();}">
+          <button onclick="App.search(document.getElementById('home-search').value)" style="flex-shrink:0;padding:0 16px;background:var(--red);border:none;border-radius:8px;color:#fff;font-size:14px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent">Go</button>
+        </div>
       </div>
 
       <div class="stats" id="stats">
@@ -559,12 +564,10 @@ const Discogs=(()=>{
   return{
     release:id=>get(`/releases/${id}`),
     search:async q=>{
-      // Build query variants: original + ING↔IN' contracted forms
-      // e.g. "George Benson Living Inside Your Love" also tries "Livin' Inside Your Love"
+      // ── Round 1: exact + ING variants ─────────────────────────────────
       const queries=ingVariants(q);
       for(const variant of queries){
         const words=variant.trim().split(/\s+/);
-        // Try artist+title split searches first (most precise)
         const splits=words.length>=3?[
           {artist:words.slice(0,2).join(' '),title:words.slice(2).join(' ')},
           {artist:words[0],title:words.slice(1).join(' ')},
@@ -574,10 +577,57 @@ const Discogs=(()=>{
           const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
           if(r.length) return r;
         }
-        // Fallback: plain q= combined search for this variant
         const r=await get(`/database/search?q=${encodeURIComponent(variant)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
         if(r.length) return r;
       }
+
+      // ── Round 2: phonetic variants per word ───────────────────────────
+      // For each word, generate sound-alike spellings and try combinations
+      const words=q.trim().split(/\s+/).filter(w=>w.length>2);
+      // Build one query per word where that word is replaced by its variants
+      const fuzzyQueries=new Set();
+      for(let i=0;i<words.length;i++){
+        const vars=phoneticVariants(words[i]);
+        for(const v of vars){
+          if(v===words[i]) continue;
+          const attempt=[...words];
+          attempt[i]=v;
+          fuzzyQueries.add(attempt.join(' '));
+        }
+      }
+      for(const fq of fuzzyQueries){
+        const fw=fq.split(/\s+/);
+        const splits=fw.length>=3?[
+          {artist:fw.slice(0,2).join(' '),title:fw.slice(2).join(' ')},
+          {artist:fw[0],title:fw.slice(1).join(' ')},
+        ]:[];
+        for(const sp of splits){
+          const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
+          const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
+          if(r.length) return r;
+        }
+        const r=await get(`/database/search?q=${encodeURIComponent(fq)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
+        if(r.length) return r;
+      }
+
+      // ── Round 3: per-word partial searches, letter-score ranked ───────
+      // Search each meaningful word individually, collect all results,
+      // rank by how many letters from the original query appear in each result
+      const partialResults=new Map(); // id→result
+      for(const word of words){
+        if(word.length<3) continue;
+        const r=await get(`/database/search?q=${encodeURIComponent(word)}&type=release&per_page=10&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
+        for(const item of r) if(item.id) partialResults.set(item.id,item);
+      }
+      if(partialResults.size){
+        const scored=[...partialResults.values()].map(r=>{
+          const candidate=`${r.title||''} ${(r.label||[]).join(' ')}`;
+          return{r,score:letterScore(q,candidate)};
+        });
+        scored.sort((a,b)=>b.score-a.score);
+        return scored.map(x=>x.r);
+      }
+
       return [];
     },
     searchArtist:artist=>get(`/database/search?artist=${encodeURIComponent(artist)}&type=release&per_page=25&format=vinyl`).then(d=>d.results||[]),
@@ -639,8 +689,7 @@ function auClean(t){
   return s.trim();
 }
 
-// Generate ING variants: "living inside" → also try "livin' inside"
-// Many classic soul/house/funk titles drop the G (livin', movin', groovin')
+// ── ING variants ──────────────────────────────────────────────────────────
 function ingVariants(q){
   const contracted=q.replace(/\b(\w+)ing\b/gi,(m,stem)=>`${stem}in'`);
   const expanded=q.replace(/\b(\w+)in'\b/gi,(m,stem)=>`${stem}ing`);
@@ -648,6 +697,57 @@ function ingVariants(q){
   if(contracted!==q) variants.push(contracted);
   if(expanded!==q) variants.push(expanded);
   return [...new Set(variants)];
+}
+
+// ── Phonetic word substitutions ───────────────────────────────────────────
+// Each pair: [regex, replacement] applied per-word to generate sound-alike spellings
+// Catches the most common STT errors where the right sound maps to wrong letters
+const PHON=[
+  [/igh/g,'i'],[/igh/g,'y'],           // "signs"→"sines" via ign→ine is below
+  [/ign/g,'ine'],[/ine/g,'ign'],        // signs↔sines, fines↔figns
+  [/ph/g,'f'],[/f(?=[aeiou])/g,'ph'],  // phase↔fase
+  [/ck/g,'k'],[/k(?=[aeiou])/g,'ck'],  // track↔trak
+  [/([aeiou])s$/g,'$1z'],[/z$/g,'s'],  // beats↔beatz
+  [/c(?=[ei])/g,'s'],[/(?<=[^s])s(?=[ei])/g,'c'], // cene↔scene
+  [/y$/g,'ie'],[/ie$/g,'y'],           // funky↔funkie
+  [/w$/g,'ue'],[/ue$/g,'w'],           // blue↔blew-ish
+  [/ou/g,'ow'],[/ow/g,'ou'],           // house↔howse
+  [/ae/g,'e'],[/(?<![a])e(?![iy])/g,'ae'], // tae↔te
+  [/([^a])i([^oa])/g,'$1y$2'],         // sines↔synes
+  [/([^a])y([^s])/g,'$1i$2'],          // synes↔sines
+  [/tion/g,'shun'],[/shun/g,'tion'],
+  [/ss/g,'s'],[/(?<=[aeiou])s(?=[aeiou])/g,'ss'],
+  [/tt/g,'t'],[/(?<=[aeiou])t(?=[aeiou])/g,'tt'],
+  [/([bcdfghjklmnpqrstvwxz])\1/g,'$1'],// double consonant drop
+];
+
+function phoneticVariants(word){
+  const w=word.toLowerCase();
+  const vars=new Set([w]);
+  for(const [pat,rep] of PHON){
+    const v=w.replace(pat,rep);
+    if(v!==w&&v.length>1) vars.add(v);
+  }
+  return [...vars];
+}
+
+// ── Letter-overlap scorer ─────────────────────────────────────────────────
+// Score how many letters from query appear in candidate (order-independent)
+// "signs atlantic" vs "Sines Atlantic" → high score
+function letterScore(query,candidate){
+  const q=query.toLowerCase().replace(/[^a-z]/g,'');
+  const c=candidate.toLowerCase().replace(/[^a-z]/g,'');
+  let score=0;
+  const cArr=[...c];
+  for(const ch of q){
+    const idx=cArr.indexOf(ch);
+    if(idx!==-1){score++;cArr.splice(idx,1);}
+  }
+  // Bonus for matching letter sequences (bigrams)
+  for(let i=0;i<q.length-1;i++){
+    if(c.includes(q[i]+q[i+1])) score+=0.5;
+  }
+  return score/(q.length||1);
 }
 
 const Voice=(()=>{
@@ -1199,8 +1299,13 @@ const App={
       status:'active',notes:''
     };
 
-    // All raw styles for genre tag picker
-    const allStyles=[...new Set([...Array.isArray(rawGenres)?rawGenres:[rawGenres],...Array.isArray(rawStyles)?rawStyles:[rawStyles]])];
+    // All raw styles for genre tags — collect everything, no toggling
+    const allTags=[...new Set([
+      ...genres,
+      ...(Array.isArray(rawStyles)?rawStyles:[rawStyles]).filter(Boolean)
+    ])];
+    // Store all tags on the pending record
+    this.pending.genres=allTags;
 
     const hasPrice=basePx!=null;
     const medDisplay=hasPrice?medFmt(basePx):'No Data';
@@ -1236,15 +1341,9 @@ const App={
           ${hasPrice?`<div class="price-note">Rounded up to nearest $1 · Edit after adding if needed</div>`:'<div class="price-note warn">⚠ No marketplace data — price manually after adding</div>'}
         </div>
 
-        <div class="field-lbl">Genre Tags — tap to toggle</div>
+        <div class="field-lbl">Genres &amp; Styles</div>
         <div class="genre-row" id="gpr">
-          ${genres.map(g=>`<span class="gp on" onclick="App.toggleG(this,'${esc(g)}')">${esc(g)}</span>`).join('')}
-          ${allStyles
-            .map(s=>GM[s]||s)
-            .filter(g=>g&&!genres.includes(g))
-            .filter((v,i,a)=>a.indexOf(v)===i)
-            .slice(0,8)
-            .map(g=>`<span class="gp off" onclick="App.toggleG(this,'${esc(g)}')">${esc(g)}</span>`).join('')}
+          ${allTags.map(g=>`<span class="gp on">${esc(g)}</span>`).join('')}
         </div>
 
         <div class="field-lbl">Notes (condition, flaws, pressing info…)</div>
@@ -1260,15 +1359,6 @@ const App={
           </div>`).join('')}
         </div>`:''}
       </div>`;
-  },
-
-  toggleG(el,g){
-    const on=el.classList.contains('on');
-    el.classList.toggle('on',!on); el.classList.toggle('off',on);
-    if(this.pending){
-      if(!on){if(!this.pending.genres.includes(g)) this.pending.genres.push(g);}
-      else{this.pending.genres=this.pending.genres.filter(x=>x!==g);}
-    }
   },
 
   async confirmAdd(){
