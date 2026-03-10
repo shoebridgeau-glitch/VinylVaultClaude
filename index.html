@@ -324,8 +324,12 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
         <div class="set-card">
           <div class="set-row">
             <label>Personal Access Token (free)</label>
-            <input class="set-in" id="tk" placeholder="dGhpcyBpcyBhIHRva2Vu…" oninput="App.saveSet()">
-            <span class="set-note">Enables lowest price &amp; marketplace stats. Free at discogs.com → Settings → Developers → Generate Token</span>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input class="set-in" id="tk" placeholder="dGhpcyBpcyBhIHRva2Vu…" style="flex:1" onkeydown="if(event.key==='Enter'){App.saveSetConfirm();this.blur();}">
+              <button onclick="App.saveSetConfirm()" style="flex-shrink:0;padding:8px 14px;background:var(--red);border:none;border-radius:6px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent">Save</button>
+            </div>
+            <span class="set-note" id="tk-saved" style="display:none;color:var(--green)">✓ Token saved</span>
+            <span class="set-note">Enables median price &amp; marketplace stats. Free at discogs.com → Settings → Developers → Generate Token</span>
           </div>
         </div>
       </div>
@@ -335,11 +339,11 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
         <div class="set-card">
           <div class="set-row">
             <label>Vendor / Shop Name (for Shopify CSV)</label>
-            <input class="set-in" id="shopn" placeholder="Your Shop Name" oninput="App.saveSet()">
+            <input class="set-in" id="shopn" placeholder="Your Shop Name" onblur="App.saveSet()" onkeydown="if(event.key==='Enter')this.blur()">
           </div>
           <div class="set-row">
             <label>Default Record Condition (for Discogs export)</label>
-            <input class="set-in" id="cond" placeholder="VG+" value="VG+" oninput="App.saveSet()">
+            <input class="set-in" id="cond" placeholder="VG+" value="VG+" onblur="App.saveSet()" onkeydown="if(event.key==='Enter')this.blur()">
           </div>
           <div class="set-row">
             <label>Pricing rule</label>
@@ -742,6 +746,19 @@ function medFmt(v){
 }
 
 /* ─────────────────────────────────────────
+   FILE STAMP  e.g. "10mar11pm-50scans"
+───────────────────────────────────────── */
+function fileStamp(count){
+  const now=new Date();
+  const day=now.getDate();
+  const mon=now.toLocaleString('en',{month:'short'}).toLowerCase(); // jan, feb…
+  let h=now.getHours();
+  const ampm=h>=12?'pm':'am';
+  h=h%12||12; // 0→12, 13→1, etc.
+  return `VinylVault-${day}${mon}${h}${ampm}-${count}scan${count!==1?'s':''}`;
+}
+
+/* ─────────────────────────────────────────
    CSV EXPORT
 ───────────────────────────────────────── */
 const Exp={
@@ -764,7 +781,7 @@ const Exp={
       const fmt=r.format?.split(' — ')[0]||'Vinyl';
       return[handle,title,body,vend,'Vinyl Record',tags,'true','Format',fmt,sku,'1',price,'true','false',r.cover_image||'',title,'active'];
     });
-    dlCSV([hdr,...rows],'shopify-products.csv');
+    dlCSV([hdr,...rows],`${fileStamp(recs.length)}-shopify.csv`);
     toast(`${recs.length} records → Shopify CSV`);
   },
   async discogs(){
@@ -783,14 +800,14 @@ const Exp={
       'For Sale',
       ''
     ]);
-    dlCSV([hdr,...rows],'discogs-inventory.csv');
+    dlCSV([hdr,...rows],`${fileStamp(recs.length)}-discogs.csv`);
     toast(`${recs.length} records → Discogs CSV`);
   },
   async json(){
     const recs=await DB.all();
     if(!recs.length){toast('No records to export','er');return;}
     const blob=new Blob([JSON.stringify({version:2,exported:new Date().toISOString(),records:recs},null,2)],{type:'application/json'});
-    dlBlob(blob,`vinylvault-${new Date().toISOString().slice(0,10)}.json`);
+    dlBlob(blob,`${fileStamp(recs.length)}.json`);
     toast(`Backed up ${recs.length} records`);
   },
   async restore(inp){
@@ -854,6 +871,14 @@ const App={
     this.set.shopName=document.getElementById('shopn').value.trim();
     this.set.cond=document.getElementById('cond').value.trim()||'VG+';
     DB.setSetting('settings',{...this.set});
+  },
+  saveSetConfirm(){
+    this.saveSet();
+    const notice=document.getElementById('tk-saved');
+    notice.style.display='block';
+    clearTimeout(this._tkT);
+    this._tkT=setTimeout(()=>notice.style.display='none',2500);
+    toast('Token saved ✓');
   },
 
   async refresh(){
