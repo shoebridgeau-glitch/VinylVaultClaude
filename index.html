@@ -36,10 +36,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--s
 
 /* ── TOPBAR ── */
 .topbar{display:flex;align-items:center;justify-content:space-between;padding:13px 16px 10px;border-bottom:1px solid var(--border);background:var(--bg);flex-shrink:0;position:relative;z-index:10}
-.logo{font-family:var(--serif);font-size:21px;letter-spacing:-.5px}
+.logo{font-family:var(--serif);font-size:21px;letter-spacing:-.5px;position:absolute;left:50%;transform:translateX(-50%);background:none;border:none;color:var(--text);cursor:pointer;-webkit-tap-highlight-color:transparent;padding:0;white-space:nowrap}
+.logo:active{opacity:.6}
 .logo em{font-style:normal;color:var(--red)}
-.topbar-r{display:flex;align-items:center;gap:10px}
+.topbar-r{display:flex;align-items:center;gap:10px;margin-left:auto}
 .count-lbl{font-family:var(--mono);font-size:11px;color:var(--t2);letter-spacing:.5px}
+@keyframes spin-once{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.logo.spinning em{display:inline-block;animation:spin-once .4s ease-out}
 
 /* ── CONTENT ── */
 .content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
@@ -96,6 +99,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--s
 .ri-art{font-size:11px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ri-ttl{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ri-px{font-family:var(--mono);font-size:12px;color:var(--green);flex-shrink:0}
+.ri{display:flex;align-items:center;gap:11px;padding:9px 0;border-bottom:1px solid var(--border);cursor:pointer;-webkit-tap-highlight-color:transparent}
+.ri:active{opacity:.6}
+.ri-tags{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
 
 /* ── INVENTORY ── */
 .filter-bar{position:sticky;top:0;z-index:5;background:var(--bg);padding:12px 16px;margin:-16px -16px 16px;border-bottom:1px solid var(--border)}
@@ -234,7 +240,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
 
   <!-- TOPBAR -->
   <header class="topbar">
-    <div class="logo">Vinyl<em>Vault</em></div>
+    <button class="logo" id="logo-btn" onclick="App.logoRefresh()">Vinyl<em>Vault</em></button>
     <div class="topbar-r">
       <span class="count-lbl" id="cnt">0 records</span>
     </div>
@@ -564,10 +570,13 @@ const Discogs=(()=>{
   return{
     release:id=>get(`/releases/${id}`),
     search:async q=>{
-      // ── Round 1: exact + ING variants ─────────────────────────────────
+      // ── Round 1: full query + ING variants ────────────────────────────
+      // Uses q= which Discogs searches across artist, title, label,
+      // tracklist, cat# and producer — no separate toggles needed.
       const queries=ingVariants(q);
       for(const variant of queries){
         const words=variant.trim().split(/\s+/);
+        // Try artist+title split first (most precise)
         const splits=words.length>=3?[
           {artist:words.slice(0,2).join(' '),title:words.slice(2).join(' ')},
           {artist:words[0],title:words.slice(1).join(' ')},
@@ -577,55 +586,25 @@ const Discogs=(()=>{
           const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
           if(r.length) return r;
         }
+        // Plain q= — searches ALL Discogs fields including tracklist & label
         const r=await get(`/database/search?q=${encodeURIComponent(variant)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
         if(r.length) return r;
       }
 
-      // ── Round 2: phonetic variants per word ───────────────────────────
-      // For each word, generate sound-alike spellings and try combinations
+      // ── Round 2: 2-word combinations ──────────────────────────────────
+      // If nothing matched the full phrase, try every pair of significant
+      // words. "Todd signs Atlantic" → tries "Todd signs", "Todd Atlantic",
+      // "signs Atlantic" — whichever pair hits first wins.
+      // Still uses q= so tracklist/label/producer are all searched.
       const words=q.trim().split(/\s+/).filter(w=>w.length>2);
-      // Build one query per word where that word is replaced by its variants
-      const fuzzyQueries=new Set();
+      const seen=new Set();
       for(let i=0;i<words.length;i++){
-        const vars=phoneticVariants(words[i]);
-        for(const v of vars){
-          if(v===words[i]) continue;
-          const attempt=[...words];
-          attempt[i]=v;
-          fuzzyQueries.add(attempt.join(' '));
-        }
-      }
-      for(const fq of fuzzyQueries){
-        const fw=fq.split(/\s+/);
-        const splits=fw.length>=3?[
-          {artist:fw.slice(0,2).join(' '),title:fw.slice(2).join(' ')},
-          {artist:fw[0],title:fw.slice(1).join(' ')},
-        ]:[];
-        for(const sp of splits){
-          const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
-          const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
+        for(let j=i+1;j<words.length;j++){
+          const pair=`${words[i]} ${words[j]}`;
+          if(seen.has(pair)) continue; seen.add(pair);
+          const r=await get(`/database/search?q=${encodeURIComponent(pair)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
           if(r.length) return r;
         }
-        const r=await get(`/database/search?q=${encodeURIComponent(fq)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
-        if(r.length) return r;
-      }
-
-      // ── Round 3: per-word partial searches, letter-score ranked ───────
-      // Search each meaningful word individually, collect all results,
-      // rank by how many letters from the original query appear in each result
-      const partialResults=new Map(); // id→result
-      for(const word of words){
-        if(word.length<3) continue;
-        const r=await get(`/database/search?q=${encodeURIComponent(word)}&type=release&per_page=10&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
-        for(const item of r) if(item.id) partialResults.set(item.id,item);
-      }
-      if(partialResults.size){
-        const scored=[...partialResults.values()].map(r=>{
-          const candidate=`${r.title||''} ${(r.label||[]).join(' ')}`;
-          return{r,score:letterScore(q,candidate)};
-        });
-        scored.sort((a,b)=>b.score-a.score);
-        return scored.map(x=>x.r);
       }
 
       return [];
@@ -697,57 +676,6 @@ function ingVariants(q){
   if(contracted!==q) variants.push(contracted);
   if(expanded!==q) variants.push(expanded);
   return [...new Set(variants)];
-}
-
-// ── Phonetic word substitutions ───────────────────────────────────────────
-// Each pair: [regex, replacement] applied per-word to generate sound-alike spellings
-// Catches the most common STT errors where the right sound maps to wrong letters
-const PHON=[
-  [/igh/g,'i'],[/igh/g,'y'],           // "signs"→"sines" via ign→ine is below
-  [/ign/g,'ine'],[/ine/g,'ign'],        // signs↔sines, fines↔figns
-  [/ph/g,'f'],[/f(?=[aeiou])/g,'ph'],  // phase↔fase
-  [/ck/g,'k'],[/k(?=[aeiou])/g,'ck'],  // track↔trak
-  [/([aeiou])s$/g,'$1z'],[/z$/g,'s'],  // beats↔beatz
-  [/c(?=[ei])/g,'s'],[/(?<=[^s])s(?=[ei])/g,'c'], // cene↔scene
-  [/y$/g,'ie'],[/ie$/g,'y'],           // funky↔funkie
-  [/w$/g,'ue'],[/ue$/g,'w'],           // blue↔blew-ish
-  [/ou/g,'ow'],[/ow/g,'ou'],           // house↔howse
-  [/ae/g,'e'],[/(?<![a])e(?![iy])/g,'ae'], // tae↔te
-  [/([^a])i([^oa])/g,'$1y$2'],         // sines↔synes
-  [/([^a])y([^s])/g,'$1i$2'],          // synes↔sines
-  [/tion/g,'shun'],[/shun/g,'tion'],
-  [/ss/g,'s'],[/(?<=[aeiou])s(?=[aeiou])/g,'ss'],
-  [/tt/g,'t'],[/(?<=[aeiou])t(?=[aeiou])/g,'tt'],
-  [/([bcdfghjklmnpqrstvwxz])\1/g,'$1'],// double consonant drop
-];
-
-function phoneticVariants(word){
-  const w=word.toLowerCase();
-  const vars=new Set([w]);
-  for(const [pat,rep] of PHON){
-    const v=w.replace(pat,rep);
-    if(v!==w&&v.length>1) vars.add(v);
-  }
-  return [...vars];
-}
-
-// ── Letter-overlap scorer ─────────────────────────────────────────────────
-// Score how many letters from query appear in candidate (order-independent)
-// "signs atlantic" vs "Sines Atlantic" → high score
-function letterScore(query,candidate){
-  const q=query.toLowerCase().replace(/[^a-z]/g,'');
-  const c=candidate.toLowerCase().replace(/[^a-z]/g,'');
-  let score=0;
-  const cArr=[...c];
-  for(const ch of q){
-    const idx=cArr.indexOf(ch);
-    if(idx!==-1){score++;cArr.splice(idx,1);}
-  }
-  // Bonus for matching letter sequences (bigrams)
-  for(let i=0;i<q.length-1;i++){
-    if(c.includes(q[i]+q[i+1])) score+=0.5;
-  }
-  return score/(q.length||1);
 }
 
 const Voice=(()=>{
@@ -1031,9 +959,14 @@ const App={
     }
     el.innerHTML=recs.map(r=>{
       const px=r.sell_price!=null?sellFmt(r.sell_price):'';
-      return`<div class="ri">
+      const tags=(r.genres||[]).slice(0,3).map(g=>`<span class="tag tag-g">${esc(g)}</span>`).join('');
+      return`<div class="ri" onclick="App.detail('${r.id}')">
         ${imgEl(r.cover_image,'ri-img',r.title)}
-        <div class="ri-meta"><div class="ri-art">${esc(r.artist)}</div><div class="ri-ttl">${esc(r.title)}</div></div>
+        <div class="ri-meta">
+          <div class="ri-art">${esc(r.artist)}</div>
+          <div class="ri-ttl">${esc(r.title)}</div>
+          ${tags?`<div class="ri-tags">${tags}</div>`:''}
+        </div>
         ${px?`<span class="ri-px">${esc(px)}</span>`:''}
       </div>`;
     }).join('');
@@ -1424,6 +1357,14 @@ const App={
     closeModal('cf-ov'); resetCfModal();
     toast('Record removed');
     await this.refresh();
+  },
+
+  logoRefresh(){
+    const btn=document.getElementById('logo-btn');
+    btn.classList.add('spinning');
+    setTimeout(()=>btn.classList.remove('spinning'),420);
+    this.refresh();
+    toast('Refreshed');
   },
 
   clearAll(){
