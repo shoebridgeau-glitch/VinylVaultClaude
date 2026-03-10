@@ -154,7 +154,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--s
 .result{display:flex;align-items:center;gap:11px;padding:11px 20px;border-bottom:1px solid var(--border);cursor:pointer;-webkit-tap-highlight-color:transparent;transition:background .12s}
 .result:active{background:var(--s2)}
 .res-img{width:50px;height:50px;border-radius:3px;background:var(--s2);object-fit:cover;flex-shrink:0;font-size:21px;display:flex;align-items:center;justify-content:center;color:var(--t3)}
-.res-ttl{font-size:14px;font-weight:600}
+.res-art-tap{cursor:pointer;-webkit-tap-highlight-color:transparent;border-bottom:1px dashed var(--t3);display:inline-block;margin-bottom:2px}
+.res-art-tap:active{opacity:.6}
 .res-art{font-size:12px;color:var(--t2)}
 .res-det{font-size:11px;color:var(--t3);font-family:var(--mono);margin-top:2px}
 .res-fmt{font-size:11px;color:var(--red);font-family:var(--mono)}
@@ -395,6 +396,11 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
       <span class="m-ttl" id="res-ttl">Select Pressing</span>
       <button class="m-close" onclick="closeModal('res-ov')">✕</button>
     </div>
+    <div style="padding:10px 16px 6px;border-bottom:1px solid var(--border);flex-shrink:0">
+      <input type="search" id="res-refine" class="srch" style="margin:0;font-size:14px"
+        placeholder="Not right? Type to refine search…"
+        onkeydown="if(event.key==='Enter'){App.refineSearch(this.value);this.blur();}">
+    </div>
     <div class="m-body" id="res-body"></div>
   </div>
 </div>
@@ -572,8 +578,26 @@ const Discogs=(()=>{
     return r.json();
   }
   return{
-    search:q=>get(`/database/search?q=${encodeURIComponent(q)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]),
-    release:id=>get(`/releases/${id}`),
+    search:async q=>{
+      // Strategy 1: split "Artist Title" → artist= + title= params (most accurate)
+      // Strategy 2: fallback to bare q= if split returns nothing
+      // This fixes cases like "George Benson Living Inside Your Love" where
+      // a single q= string matches poorly against Discogs full-text index.
+      const words=q.trim().split(/\s+/);
+      // Try artist = first 2 words, title = rest; then artist = first word, title = rest
+      const splits=words.length>=3?[
+        {artist:words.slice(0,2).join(' '),title:words.slice(2).join(' ')},
+        {artist:words[0],title:words.slice(1).join(' ')},
+      ]:[];
+      for(const sp of splits){
+        const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
+        const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
+        if(r.length) return r;
+      }
+      // Fallback: plain q= combined search
+      return get(`/database/search?q=${encodeURIComponent(q)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]);
+    },
+    searchArtist:artist=>get(`/database/search?artist=${encodeURIComponent(artist)}&type=release&per_page=25&format=vinyl`).then(d=>d.results||[]),
     stats:id=>get(`/marketplace/stats/${id}`).catch(()=>null),
     fmt:(v,c)=>{
       if(v==null||v===''||isNaN(v)) return null;
@@ -1017,6 +1041,7 @@ const App={
         return;
       }
       this.renderResults(results,q);
+      document.getElementById('res-refine').value='';
       openModal('res-ov');
     }catch(e){
       showDisc(false);
@@ -1027,9 +1052,24 @@ const App={
     }
   },
 
-  renderResults(res,q){
+  async refineSearch(q){
+    q=q.trim(); if(!q) return;
+    const body=document.getElementById('res-body');
+    body.innerHTML=`<div class="ld"><div class="spin"></div> Searching…</div>`;
+    try{
+      const results=await Discogs.search(q);
+      this.cache=results;
+      document.getElementById('res-ttl').textContent=`"${q}" — ${results.length} pressings`;
+      this.renderResults(results,q);
+    }catch(e){
+      body.innerHTML=`<div class="empty"><div class="empty-ico">📡</div><div class="empty-ttl">Search failed</div><div class="empty-sub">Check connection and try again</div></div>`;
+    }
+  },
+
+  renderResults(res,q,showBack){
     document.getElementById('res-ttl').textContent=`"${q}" — ${res.length} pressings`;
-    document.getElementById('res-body').innerHTML=res.length?res.map((r,i)=>{
+    const back=showBack?`<div style="padding:9px 20px;border-bottom:1px solid var(--border)"><button onclick="App.restoreCache()" style="background:none;border:none;color:var(--red);font-size:13px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent">← Back to original results</button></div>`:'';
+    document.getElementById('res-body').innerHTML=back+(res.length?res.map((r,i)=>{
       const parts=r.title?r.title.split(' - '):['?'];
       const artist=parts[0];
       const title=parts.slice(1).join(' - ')||parts[0];
@@ -1037,14 +1077,39 @@ const App={
       const fmt=r.format?r.format.join(', '):'';
       return`<div class="result" onclick="App.pick(${i})">
         ${imgEl(r.thumb||r.cover_image,'res-img',title)}
-        <div>
-          <div class="res-art">${esc(artist)}</div>
+        <div style="flex:1;min-width:0">
+          <div class="res-art res-art-tap" onclick="event.stopPropagation();App.browseArtist('${esc(artist)}')" title="Tap to see all releases by this artist">${esc(artist)} <span style="color:var(--red);font-size:10px">▼ all releases</span></div>
           <div class="res-ttl">${esc(title)}</div>
           <div class="res-det">${esc(det)}</div>
           ${fmt?`<div class="res-fmt">${esc(fmt)}</div>`:''}
         </div>
       </div>`;
-    }).join(''):`<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No results</div><div class="empty-sub">Try rephrasing artist or title</div></div>`;
+    }).join(''):`<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No results</div><div class="empty-sub">Try rephrasing artist or title</div></div>`);
+  },
+
+  _prevCache:[],_prevQ:'',
+
+  async browseArtist(artist){
+    // Save current results so user can go back
+    this._prevCache=[...this.cache];
+    this._prevQ=document.getElementById('res-ttl').textContent;
+    const body=document.getElementById('res-body');
+    body.innerHTML=`<div class="ld"><div class="spin"></div> Loading all releases by ${esc(artist)}…</div>`;
+    document.getElementById('res-ttl').textContent=`All releases: ${artist}`;
+    try{
+      const results=await Discogs.searchArtist(artist);
+      this.cache=results;
+      this.renderResults(results,artist,true);
+    }catch(e){
+      body.innerHTML=`<div class="empty"><div class="empty-ico">📡</div><div class="empty-ttl">Failed to load</div><div class="empty-sub">Check your connection</div></div>`;
+    }
+  },
+
+  restoreCache(){
+    this.cache=this._prevCache;
+    document.getElementById('res-ttl').textContent=this._prevQ;
+    const parts=this._prevQ.replace(/"/g,'').split(' — ')[0];
+    this.renderResults(this._prevCache,parts,false);
   },
 
   async pick(i){
