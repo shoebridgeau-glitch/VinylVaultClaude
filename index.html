@@ -447,9 +447,38 @@ const GM = {
   'Downtempo':'Downtempo','IDM':'IDM','New Beat':'New Beat',
   'Chicago Techno':'Techno','UK Techno':'Techno',
 };
+// Broad genres to skip as standalone tags (too generic to be useful)
+const SKIP_GENRES=new Set(['Electronic','Pop','Rock','Classical','Jazz','Folk, World, & Country','Funk / Soul','Hip Hop','Reggae','Blues','Non-Music','Stage & Screen','Children\'s','Brass & Military','Latin']);
+
 function mapGenres(genres,styles){
-  const src=[...(genres||[]),...(styles||[])];
-  return [...new Set(src.map(g=>GM[g]).filter(Boolean))];
+  const out=new Set();
+  // 1. Map styles through GM lookup first (most specific)
+  for(const s of (styles||[])){
+    if(GM[s]) out.add(GM[s]);
+  }
+  // 2. Map top-level genres through GM
+  for(const g of (genres||[])){
+    if(GM[g]) out.add(GM[g]);
+  }
+  // 3. If still empty, fall back to raw styles (they're more specific than genres)
+  if(!out.size){
+    for(const s of (styles||[])){
+      if(s&&!SKIP_GENRES.has(s)) out.add(s);
+    }
+  }
+  // 4. If still empty, fall back to raw top-level genres, filtering generic ones
+  if(!out.size){
+    for(const g of (genres||[])){
+      if(g&&!SKIP_GENRES.has(g)) out.add(g);
+    }
+  }
+  // 5. Last resort: include even generic genres so card is never tagless
+  if(!out.size){
+    for(const g of [...(genres||[]),...(styles||[])].slice(0,2)){
+      if(g) out.add(g);
+    }
+  }
+  return [...out];
 }
 
 /* ─────────────────────────────────────────
@@ -689,9 +718,15 @@ function resetCfModal(){
   document.getElementById('cf-title').textContent='Confirm & Add';
   document.getElementById('cf-foot').style.display='';
 }
+function imgErr(el,cls){
+  // Safe image fallback — avoids embedding HTML with > inside an onerror attribute
+  const d=document.createElement('div');
+  d.className=cls; d.textContent='💿';
+  el.parentNode&&el.parentNode.replaceChild(d,el);
+}
 function imgEl(src,cls,alt){
   if(!src) return `<div class="${cls}">💿</div>`;
-  return `<img class="${cls}" src="${esc(src)}" alt="${esc(alt||'')}" loading="lazy" onerror="this.outerHTML='<div class=\\"${cls}\\">💿</div>'">`;
+  return `<img class="${cls}" src="${esc(src)}" alt="${esc(alt||'')}" loading="lazy" onerror="imgErr(this,'${cls}')">`;
 }
 function fmtPrice(price,cur){
   return Discogs.fmt(price,cur||App.set.cur||'USD')||'—';
