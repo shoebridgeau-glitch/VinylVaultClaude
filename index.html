@@ -40,14 +40,6 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--s
 .logo em{font-style:normal;color:var(--red)}
 .topbar-r{display:flex;align-items:center;gap:10px}
 .count-lbl{font-family:var(--mono);font-size:11px;color:var(--t2);letter-spacing:.5px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--green);transition:background .3s}
-.dot.off{background:var(--red)}
-
-/* ── QUEUE BANNER ── */
-.q-banner{display:none;align-items:center;justify-content:space-between;padding:7px 16px;background:rgba(255,214,10,.08);border-bottom:1px solid rgba(255,214,10,.18);flex-shrink:0}
-.q-banner.on{display:flex}
-.q-text{font-size:12px;color:var(--yellow)}
-.q-retry{font-size:12px;color:var(--yellow);background:rgba(255,214,10,.12);border:1px solid rgba(255,214,10,.25);border-radius:4px;padding:3px 10px;cursor:pointer}
 
 /* ── CONTENT ── */
 .content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
@@ -245,15 +237,8 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
     <div class="logo">Vinyl<em>Vault</em></div>
     <div class="topbar-r">
       <span class="count-lbl" id="cnt">0 records</span>
-      <div class="dot" id="dot"></div>
     </div>
   </header>
-
-  <!-- QUEUE BANNER -->
-  <div class="q-banner" id="qb">
-    <span class="q-text" id="qt">⚠ queued lookups</span>
-    <button class="q-retry" onclick="App.retryQueue()">Retry Now</button>
-  </div>
 
   <!-- CONTENT -->
   <main class="content">
@@ -508,10 +493,11 @@ const DB=(()=>{
           s.createIndex('added_date','added_date',{unique:false});
           s.createIndex('discogs_id','discogs_id',{unique:false});
         }
-        if(!d.objectStoreNames.contains('queue'))
-          d.createObjectStore('queue',{keyPath:'id',autoIncrement:true});
         if(!d.objectStoreNames.contains('settings'))
           d.createObjectStore('settings',{keyPath:'key'});
+        // Remove legacy queue store if present from older version
+        if(d.objectStoreNames.contains('queue'))
+          d.deleteObjectStore('queue');
       };
       r.onsuccess=e=>{_db=e.target.result;res(_db)};
       r.onerror=()=>rej(r.error);
@@ -542,15 +528,6 @@ const DB=(()=>{
       const r=d.transaction('records','readonly').objectStore('records').count();
       r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);
     })),
-    qAdd:item=>open().then(d=>new Promise((res,rej)=>{
-      const r=d.transaction('queue','readwrite').objectStore('queue').add(item);
-      r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);
-    })),
-    qAll:()=>getAll('queue'),
-    qClear:()=>open().then(d=>new Promise((res,rej)=>{
-      const r=d.transaction('queue','readwrite').objectStore('queue').clear();
-      r.onsuccess=()=>res();r.onerror=()=>rej(r.error);
-    })),
     getSetting:key=>txOp('settings','readonly',s=>s.get(key)).then(r=>r?r.v:null).catch(()=>null),
     setSetting:(key,v)=>txOp('settings','readwrite',s=>s.put({key,v})),
   };
@@ -578,24 +555,28 @@ const Discogs=(()=>{
     return r.json();
   }
   return{
+    release:id=>get(`/releases/${id}`),
     search:async q=>{
-      // Strategy 1: split "Artist Title" → artist= + title= params (most accurate)
-      // Strategy 2: fallback to bare q= if split returns nothing
-      // This fixes cases like "George Benson Living Inside Your Love" where
-      // a single q= string matches poorly against Discogs full-text index.
-      const words=q.trim().split(/\s+/);
-      // Try artist = first 2 words, title = rest; then artist = first word, title = rest
-      const splits=words.length>=3?[
-        {artist:words.slice(0,2).join(' '),title:words.slice(2).join(' ')},
-        {artist:words[0],title:words.slice(1).join(' ')},
-      ]:[];
-      for(const sp of splits){
-        const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
-        const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
+      // Build query variants: original + ING↔IN' contracted forms
+      // e.g. "George Benson Living Inside Your Love" also tries "Livin' Inside Your Love"
+      const queries=ingVariants(q);
+      for(const variant of queries){
+        const words=variant.trim().split(/\s+/);
+        // Try artist+title split searches first (most precise)
+        const splits=words.length>=3?[
+          {artist:words.slice(0,2).join(' '),title:words.slice(2).join(' ')},
+          {artist:words[0],title:words.slice(1).join(' ')},
+        ]:[];
+        for(const sp of splits){
+          const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
+          const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
+          if(r.length) return r;
+        }
+        // Fallback: plain q= combined search for this variant
+        const r=await get(`/database/search?q=${encodeURIComponent(variant)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
         if(r.length) return r;
       }
-      // Fallback: plain q= combined search
-      return get(`/database/search?q=${encodeURIComponent(q)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]);
+      return [];
     },
     searchArtist:artist=>get(`/database/search?artist=${encodeURIComponent(artist)}&type=release&per_page=25&format=vinyl`).then(d=>d.results||[]),
     stats:id=>get(`/marketplace/stats/${id}`).catch(()=>null),
@@ -654,6 +635,17 @@ function auClean(t){
   let s=t;
   for(const [pat,rep] of AU_FIXES) s=s.replace(pat,rep);
   return s.trim();
+}
+
+// Generate ING variants: "living inside" → also try "livin' inside"
+// Many classic soul/house/funk titles drop the G (livin', movin', groovin')
+function ingVariants(q){
+  const contracted=q.replace(/\b(\w+)ing\b/gi,(m,stem)=>`${stem}in'`);
+  const expanded=q.replace(/\b(\w+)in'\b/gi,(m,stem)=>`${stem}ing`);
+  const variants=[q];
+  if(contracted!==q) variants.push(contracted);
+  if(expanded!==q) variants.push(expanded);
+  return [...new Set(variants)];
 }
 
 const Voice=(()=>{
@@ -878,8 +870,6 @@ const App={
   async init(){
     await this.loadSet();
     await this.refresh();
-    this.watchOnline();
-    await this.updateQBanner();
     // populate settings UI
     document.getElementById('tk').value=this.set.token||'';
     document.getElementById('shopn').value=this.set.shopName||'';
@@ -999,7 +989,7 @@ const App={
     }
     const html=recs.map(r=>{
       const sp=r.sell_price!=null?sellFmt(r.sell_price):'—';
-      const mp=r.median_price!=null?`<span class="rc-med">med ${medFmt(r.median_price)}</span>`:'';
+      const mp=r.lowest_price!=null?`<span class="rc-med">low ${medFmt(r.lowest_price)}</span>`:'';
       const tags=(r.genres||[]).slice(0,3).map(g=>`<span class="tag tag-g">${esc(g)}</span>`).join('');
       const fmt=r.format?.split(' — ')[0];
       return`<div class="rc" onclick="App.detail('${r.id}')">
@@ -1035,9 +1025,8 @@ const App={
       showDisc(false);
       setTx(q,false);
       if(!results.length){
-        await DB.qAdd({query:q,ts:Date.now()});
-        await this.updateQBanner();
-        toast('No results — queued for when online','er');
+        toast('No results found — try rephrasing','er');
+        setTx('No results — try again',false);
         return;
       }
       this.renderResults(results,q);
@@ -1045,10 +1034,8 @@ const App={
       openModal('res-ov');
     }catch(e){
       showDisc(false);
-      setTx('Offline — queued for retry',false);
-      await DB.qAdd({query:q,ts:Date.now()});
-      await this.updateQBanner();
-      toast('Offline — queued for retry','er');
+      setTx('Search failed — check connection',false);
+      toast('Search failed: '+e.message,'er');
     }
   },
 
@@ -1144,17 +1131,22 @@ const App={
     const country=rel.country||'';
     const fmt=(rel.formats?.[0]?.name||rel.format?.[0]||'Vinyl')+
       (rel.formats?.[0]?.descriptions?.length?' — '+rel.formats[0].descriptions.join(', '):'');
-    const genres=mapGenres(rel.genres,rel.styles);
+    // Normalise genres/styles — search results use singular (genre/style),
+    // full release objects use plural (genres/styles). Handle both.
+    const rawGenres=rel.genres||rel.genre||[];
+    const rawStyles=rel.styles||rel.style||[];
+    const genres=mapGenres(
+      Array.isArray(rawGenres)?rawGenres:[rawGenres],
+      Array.isArray(rawStyles)?rawStyles:[rawStyles]
+    );
 
     // ── PRICING ─────────────────────────────
-    // Use Discogs marketplace median price as the base.
-    // Sell price = ceil(median × 2) → whole dollars only.
-    let medianPx=null;
-    if(stat?.median_price?.value!=null) medianPx=parseFloat(stat.median_price.value);
-    // Fallback: if no median, use lowest listed
-    else if(stat?.lowest_price?.value!=null) medianPx=parseFloat(stat.lowest_price.value);
-    else if(rel.lowest_price!=null) medianPx=parseFloat(rel.lowest_price);
-    const sellPx=medianPx!=null?Math.ceil(medianPx*2):null;
+    // Discogs free API stats endpoint returns lowest_price only — no median.
+    // Use lowest_price as the base; sell price = ceil(lowest × 2).
+    let basePx=null;
+    if(stat?.lowest_price?.value!=null) basePx=parseFloat(stat.lowest_price.value);
+    else if(rel.lowest_price!=null) basePx=parseFloat(rel.lowest_price);
+    const sellPx=basePx!=null?Math.ceil(basePx*2):null;
 
     const img=rel.images?.[0]?.uri||rel.thumb||rel.cover_image||'';
     const tracks=(rel.tracklist||[]).slice(0,24);
@@ -1165,24 +1157,24 @@ const App={
       artist,title,label,cat_no:catno,
       year:parseInt(year)||null,country,
       format:fmt,genres,
-      styles:rel.styles||[],
+      styles:Array.isArray(rawStyles)?rawStyles:[rawStyles],
       tracklist:tracks.map(t=>`${t.position} ${t.title}`).join('\n'),
       cover_image:img,
       discogs_url:`https://www.discogs.com/release/${rel.id}`,
-      median_price:medianPx,          // Discogs median listed price (USD)
-      sell_price:sellPx,              // ceil(median × 2) — your listing price
+      lowest_price:basePx,
+      sell_price:sellPx,
       num_for_sale:stat?.num_for_sale??rel.num_for_sale??null,
       added_date:new Date().toISOString(),
       status:'active',notes:''
     };
 
-    // All Discogs styles available
-    const allStyles=[...new Set([...(rel.genres||[]),...(rel.styles||[])])];
+    // All raw styles for genre tag picker
+    const allStyles=[...new Set([...Array.isArray(rawGenres)?rawGenres:[rawGenres],...Array.isArray(rawStyles)?rawStyles:[rawStyles]])];
 
-    const hasPrice=medianPx!=null;
-    const medDisplay=hasPrice?medFmt(medianPx):'No Data';
+    const hasPrice=basePx!=null;
+    const medDisplay=hasPrice?medFmt(basePx):'No Data';
     const sellDisplay=hasPrice?sellFmt(sellPx):'—';
-    const priceSrc=stat?.median_price?.value!=null?'Discogs Median':stat?.lowest_price?.value!=null?'Lowest Listed (used as base)':'No Market Data';
+    const priceSrc=hasPrice?'Lowest Listed':'No Market Data';
 
     document.getElementById('cf-body').innerHTML=`
       ${img?`<img class="cf-cover" src="${esc(img)}" alt="${esc(title)}" onerror="this.style.display='none'">`:''}
@@ -1272,7 +1264,7 @@ const App={
   async detail(id){
     const r=this.recs.find(x=>x.id===id); if(!r) return;
     const sp=r.sell_price!=null?sellFmt(r.sell_price):'—';
-    const mp=r.median_price!=null?medFmt(r.median_price):'—';
+    const mp=r.lowest_price!=null?medFmt(r.lowest_price):'—';
     document.getElementById('cf-title').textContent='Record Details';
     document.getElementById('cf-foot').style.display='none';
     document.getElementById('cf-body').innerHTML=`
@@ -1289,7 +1281,7 @@ const App={
         </div>
         <div class="price-box">
           <div class="price-row">
-            <div class="price-col"><div class="price-lbl">Discogs Median</div><div class="price-val med">${esc(mp)}</div></div>
+            <div class="price-col"><div class="price-lbl">Lowest Listed</div><div class="price-val med">${esc(mp)}</div></div>
             <div class="price-arrow">×2 ↗</div>
             <div class="price-col"><div class="price-lbl">Your Price</div><div class="price-val sell">${esc(sp)}</div></div>
           </div>
@@ -1311,36 +1303,6 @@ const App={
     closeModal('cf-ov'); resetCfModal();
     toast('Record removed');
     await this.refresh();
-  },
-
-  async updateQBanner(){
-    const q=await DB.qAll();
-    const bn=document.getElementById('qb');
-    bn.classList.toggle('on',q.length>0);
-    if(q.length) document.getElementById('qt').textContent=`⚠ ${q.length} lookup${q.length>1?'s':''} queued offline`;
-  },
-
-  async retryQueue(){
-    const q=await DB.qAll();
-    if(!q.length){toast('Queue is empty');return;}
-    toast(`Retrying ${q.length} queued lookups…`);
-    await DB.qClear();
-    await this.updateQBanner();
-    for(const item of q){
-      await this.search(item.query);
-      await new Promise(r=>setTimeout(r,1500));
-    }
-  },
-
-  watchOnline(){
-    const dot=document.getElementById('dot');
-    const upd=()=>{
-      dot.classList.toggle('off',!navigator.onLine);
-      if(navigator.onLine) this.retryQueue().catch(()=>{});
-    };
-    window.addEventListener('online',upd);
-    window.addEventListener('offline',upd);
-    upd();
   },
 
   clearAll(){
