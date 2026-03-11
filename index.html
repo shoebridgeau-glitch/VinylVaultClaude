@@ -86,10 +86,26 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--s
 .disc.on{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* Search progress popup — centred on screen */
-#srch-progress{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--s2);border:1px solid var(--border);border-radius:14px;padding:18px 24px;min-width:280px;max-width:90vw;z-index:999;display:none;box-shadow:0 8px 40px rgba(0,0,0,.8);text-align:left}
+/* Search progress popup — fixed centre, unaffected by keyboard */
+#srch-progress{
+  position:fixed;
+  top:40%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  background:var(--s2);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:18px 24px;
+  min-width:280px;
+  max-width:90vw;
+  z-index:10000;
+  display:none;
+  box-shadow:0 8px 40px rgba(0,0,0,.85);
+  text-align:left;
+  /* Stay above keyboard on Android — use env() if available */
+}
 #srch-progress.on{display:block}
-#srch-progress-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:998;display:none}
+#srch-progress-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:none}
 #srch-progress-backdrop.on{display:block}
 .sp-hd{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--t2);margin-bottom:12px}
 .sp-step{font-size:13px;font-family:var(--mono);color:var(--t3);padding:4px 0;display:flex;align-items:center;gap:10px;transition:color .2s}
@@ -962,7 +978,7 @@ const Exp={
     const hdr=['Handle','Title','Body (HTML)','Vendor','Type','Tags','Published',
       'Option1 Name','Option1 Value','Variant SKU','Variant Inventory Qty',
       'Variant Price','Variant Requires Shipping','Variant Taxable',
-      'Image Src','Image Alt Text','Status'];
+      'Image Src','Image Alt Text','Country of Origin','Status'];
     const rows=recs.map(r=>{
       const handle=slug(`${r.artist} ${r.title}`);
       const title=`${r.artist} – ${r.title}`;
@@ -972,7 +988,7 @@ const Exp={
       const price=r.sell_price!=null?String(r.sell_price):'';
       const sku=`VV-${(r.discogs_id||uid()).toString().slice(0,10).toUpperCase()}`;
       const fmt=r.format?.split(' — ')[0]||'Vinyl';
-      return[handle,title,body,vend,'Vinyl Record',tags,'true','Format',fmt,sku,'1',price,'true','false',r.cover_image||'',title,'active'];
+      return[handle,title,body,vend,'Vinyl Record',tags,'true','Format',fmt,sku,'1',price,'true','false',r.cover_image||'',title,r.country||'','active'];
     });
     dlCSV([hdr,...rows],`${fileStamp(recs.length)}-shopify.csv`);
     toast(`${recs.length} records → Shopify CSV`);
@@ -981,7 +997,7 @@ const Exp={
     const recs=await DB.all();
     if(!recs.length){toast('No records to export','er');return;}
     const cond=App.set.cond||'VG+';
-    const hdr=['release_id','qty','condition','sleeve_condition','price','comments','allow_offers','status','location'];
+    const hdr=['release_id','qty','condition','sleeve_condition','price','comments','allow_offers','status','location','country'];
     const rows=recs.map(r=>[
       r.discogs_id||'',
       1,
@@ -991,7 +1007,8 @@ const Exp={
       r.notes||'',
       0,
       'For Sale',
-      ''
+      '',
+      r.country||''
     ]);
     dlCSV([hdr,...rows],`${fileStamp(recs.length)}-discogs.csv`);
     toast(`${recs.length} records → Discogs CSV`);
@@ -1350,6 +1367,7 @@ const App={
           </div>
         </div>`;
       }).join('');
+      body.scrollTop=0;
     }
   },
 
@@ -1361,10 +1379,8 @@ const App={
 
   renderResults(res,q,showBack,didYouMean=''){
     this._lastQ = q;
-    // Clear the local filter bar
     const fbar=document.getElementById('res-filter');
     if(fbar) fbar.value='';
-    // Sort by equal-weight relevance score
     const sorted = [...res].sort((a,b)=>this.scoreResult(b,q)-this.scoreResult(a,q));
     document.getElementById('res-ttl').textContent=`"${q}" — ${sorted.length} pressings`;
     const back=showBack?`<div style="padding:9px 20px;border-bottom:1px solid var(--border)"><button onclick="App.restoreCache()" style="background:none;border:none;color:var(--red);font-size:13px;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent">← Back to original results</button></div>`:'';
@@ -1385,6 +1401,8 @@ const App={
         </div>
       </div>`;
     }).join(''):`<div class="empty"><div class="empty-ico">🔍</div><div class="empty-ttl">No results</div><div class="empty-sub">Try rephrasing artist or title</div></div>`);
+    // Always scroll back to top
+    document.getElementById('res-body').scrollTop=0;
   },
 
   _prevCache:[],_prevQ:'',
@@ -1603,7 +1621,13 @@ const App={
           </div>
         </div>
         <div class="genre-row">${(r.genres||[]).map(g=>`<span class="gp on">${esc(g)}</span>`).join('')}</div>
-        ${r.notes?`<p style="font-size:12px;color:var(--t2);margin-bottom:10px;line-height:1.5">📝 ${esc(r.notes)}</p>`:''}
+        <div style="margin:12px 0 4px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--t2)">Notes</div>
+        <textarea id="det-notes" rows="3"
+          style="width:100%;background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:13px;font-family:var(--sans);line-height:1.5;resize:none;-webkit-tap-highlight-color:transparent"
+          placeholder="Condition, pressing info, flaws…"
+          onblur="App.saveNotes('${r.id}',this.value)"
+        >${esc(r.notes||'')}</textarea>
+        <div id="det-notes-status" style="font-size:11px;color:var(--green);height:16px;margin-bottom:6px;text-align:right"></div>
         ${r.tracklist?`<div class="tracklist"><div class="tl-hd">Tracklist</div>${r.tracklist.split('\n').map(t=>`<div class="tr"><span class="tr-nm">${esc(t)}</span></div>`).join('')}</div>`:''}
         <div style="display:flex;gap:8px;margin-top:14px">
           ${r.discogs_url?`<a href="${esc(r.discogs_url)}" target="_blank" rel="noopener" style="flex:1;text-align:center;padding:10px;background:var(--s2);border:1px solid var(--border);border-radius:8px;color:var(--t2);font-size:13px;text-decoration:none">View on Discogs ↗</a>`:''}
@@ -1611,6 +1635,16 @@ const App={
         </div>
       </div>`;
     openModal('cf-ov');
+  },
+
+  async saveNotes(id, val){
+    const r=this.recs.find(x=>x.id===id); if(!r) return;
+    r.notes=val.trim();
+    await DB.put(r);
+    const status=document.getElementById('det-notes-status');
+    if(status){status.textContent='✓ Saved';setTimeout(()=>{if(status) status.textContent='';},2000);}
+    // Refresh cache silently so recent/catalog reflect the change
+    this.recs=await DB.all();
   },
 
   async del(id){
