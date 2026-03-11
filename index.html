@@ -632,39 +632,92 @@ const Discogs=(()=>{
     searchWithFallback:async q=>{
       progShow();
 
-      // Combine all variant strategies into round 1
-      progStep(1,`Searching "${q}"…`);
-      const allVariants=[...new Set([...ingVariants(q),...numVariants(q)])];
-      for(const variant of allVariants){
-        if(_searchAbort){progHide();return {results:[],usedQuery:null};}
-        const words=variant.trim().split(/\s+/);
-        const splits=words.length>=3?[
-          {artist:words.slice(0,2).join(' '),title:words.slice(2).join(' ')},
-          {artist:words[0],title:words.slice(1).join(' ')},
-        ]:[];
-        for(const sp of splits){
-          if(_searchAbort){progHide();return {results:[],usedQuery:null};}
-          const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
-          const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
-          if(r.length){progHide();return {results:r, usedQuery:variant===q?null:variant};}
+      // ── Pre-process: collapse spell-outs ("A L N O S 0 6" → "ALNOS06")
+      const collapsed=collapseSpellOut(q);
+      const canonical=(collapsed||q).trim();
+
+      // ── Helper: one Discogs request
+      const tryQ=async(url)=>{
+        if(_searchAbort) return [];
+        return get(url).then(d=>d.results||[]).catch(()=>[]);
+      };
+
+      // ── Generate word-drop combinations ──────────────────────────────────
+      // Given words [A,B,C,D,E], produce all contiguous subsets of length ≥3,
+      // ordered from longest to shortest, left-to-right then right-to-left trim.
+      // This ensures we try "A B C D" before "A B C" and "B C D E" before "B C D".
+      function wordCombos(words, minLen=3){
+        const combos=[];
+        for(let len=words.length;len>=minLen;len--){
+          for(let start=0;start<=words.length-len;start++){
+            combos.push(words.slice(start,start+len).join(' '));
+          }
         }
-        if(_searchAbort){progHide();return {results:[],usedQuery:null};}
-        const r=await get(`/database/search?q=${encodeURIComponent(variant)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
-        if(r.length){progHide();return {results:r, usedQuery:variant===q?null:variant};}
+        // deduplicate
+        return [...new Set(combos)];
       }
 
-      // Round 2: 2-word pairs
-      progStep(2,'Trying word pairs…');
-      const words=q.trim().split(/\s+/).filter(w=>w.length>2);
-      const seen=new Set();
-      for(let i=0;i<words.length;i++){
-        for(let j=i+1;j<words.length;j++){
-          if(_searchAbort){progHide();return {results:[],usedQuery:null};}
-          const pair=`${words[i]} ${words[j]}`;
-          if(seen.has(pair)) continue; seen.add(pair);
-          const r=await get(`/database/search?q=${encodeURIComponent(pair)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
-          if(r.length){progHide();return {results:r, usedQuery:pair};}
+      // Also add joined adjacent pairs (catches "night time" → "nighttime")
+      function addJoins(words){
+        const extra=new Set();
+        for(let i=0;i<words.length-1;i++){
+          const joined=[...words];
+          joined.splice(i,2,words[i]+words[i+1]);
+          extra.add(joined.join(' '));
         }
+        return [...extra];
+      }
+
+      const words=canonical.split(/\s+/).filter(Boolean);
+
+      // ── Round 1a: cat# direct field search (fastest path)
+      if(looksLikeCatNo(canonical)){
+        progStep(1,`Cat# search "${canonical}"…`);
+        for(const cat of [...new Set([
+          canonical.replace(/\s+/g,'').toUpperCase(),
+          canonical,
+          ...catVariants(canonical),
+        ])]){
+          if(_searchAbort){progHide();return {results:[],usedQuery:null};}
+          const r=await tryQ(`/database/search?catno=${encodeURIComponent(cat)}&type=release&per_page=15&format=vinyl`);
+          if(r.length){progHide();return {results:r,usedQuery:collapsed?canonical:null};}
+        }
+      }
+
+      // ── Round 1b: full phrase + joined variants
+      progStep(1,`Searching "${canonical}"…`);
+      const fullVariants=[canonical,...addJoins(words),...catVariants(canonical)];
+      if(collapsed) fullVariants.push(q,...addJoins(q.split(/\s+/).filter(Boolean)));
+      for(const v of [...new Set(fullVariants)]){
+        if(_searchAbort){progHide();return {results:[],usedQuery:null};}
+        const r=await tryQ(`/database/search?q=${encodeURIComponent(v)}&type=release&per_page=15&format=vinyl`);
+        if(r.length){progHide();return {results:r,usedQuery:v!==q?v:null};}
+      }
+
+      // ── Round 2: drop words one at a time (contiguous subsets, longest first)
+      // Minimum 3 words — if 3 consecutive exact words match, that's enough
+      if(words.length>3){
+        progStep(2,'Trying shorter phrases…');
+        const combos=wordCombos(words, Math.min(3, words.length-1));
+        for(const combo of combos){
+          if(_searchAbort){progHide();return {results:[],usedQuery:null};}
+          // Also try joined version of this combo
+          const joinsOfCombo=addJoins(combo.split(' '));
+          for(const v of [combo,...joinsOfCombo]){
+            if(_searchAbort){progHide();return {results:[],usedQuery:null};}
+            const r=await tryQ(`/database/search?q=${encodeURIComponent(v)}&type=release&per_page=15&format=vinyl`);
+            if(r.length){progHide();return {results:r,usedQuery:v};}
+          }
+        }
+      }
+
+      // ── Fallback: 2 longest words (show something, let user edit)
+      progStep(2,'Broad fallback…');
+      const sigWords=[...words].sort((a,b)=>b.length-a.length).slice(0,2);
+      if(sigWords.length){
+        const r=await tryQ(`/database/search?q=${encodeURIComponent(sigWords.join(' '))}&type=release&per_page=15&format=vinyl`);
+        progHide();
+        return {results:r,usedQuery:r.length?sigWords.join(' '):null};
       }
 
       progHide();
@@ -807,6 +860,37 @@ const ENDING_SWAPS=[
   ['ck','k'],['k','ck'],             // trek↔treck
   ['s','z'],['z','s'],               // beatz↔beats
 ];
+// ── Spell-out collapse ────────────────────────────────────────────────────
+// STT writes "A L N O S 0 6" when you spell a cat#.
+// Detect runs of 3+ consecutive single-char tokens and join them into one word.
+// "krol A L N O S 0 6" → "krol ALNOS06"
+// "A B records ALNOS 06" → "AB records ALNOS06"
+function collapseSpellOut(q){
+  const tokens=q.trim().split(/\s+/);
+  const out=[];
+  let run=[];
+  const flush=()=>{
+    if(run.length>=3) out.push(run.join('').toUpperCase());
+    else out.push(...run);
+    run=[];
+  };
+  for(const t of tokens){
+    if(t.length===1) run.push(t);
+    else { flush(); out.push(t); }
+  }
+  flush();
+  const collapsed=out.join(' ');
+  return collapsed===q?null:collapsed; // null = no change
+}
+
+// ── Cat# auto-detect ──────────────────────────────────────────────────────
+// Returns true if the query (or part of it) looks like a catalogue number:
+// letters followed by digits, optionally with dash/space, 4–10 chars total
+// e.g. ALNOS06, JBO24, WE-015, NM21008
+function looksLikeCatNo(q){
+  return /\b[A-Z]{1,6}[-\s]?\d{1,6}\b/i.test(q);
+}
+
 function ingVariants(q){
   const variants=new Set([q]);
   // ING ↔ IN' contractions
@@ -837,6 +921,41 @@ function ingVariants(q){
     variants.add(joined.join(' '));
   }
   return [...variants];
+}
+
+// ── Cat# / label code variants ────────────────────────────────────────────
+// Handles the STT space problem: "JBO 24" ↔ "JBO24", "WE 015" ↔ "WE015"
+// Also strips/adds dashes: "NM-21008" ↔ "NM 21008" ↔ "NM21008"
+// Runs on the full query so it works wherever the code appears
+function catVariants(q){
+  const vars=new Set([q]);
+
+  // 1. Join: letters followed by space then digits (or vice versa)
+  //    "JBO 24" → "JBO24",  "WE 015" → "WE015"
+  const joined=q.replace(/\b([A-Za-z]{1,6})\s+(\d{1,6})\b/g,'$1$2')
+               .replace(/\b(\d{1,6})\s+([A-Za-z]{1,6})\b/g,'$1$2');
+  if(joined!==q) vars.add(joined);
+
+  // 2. Split: letters immediately followed by digits (no space)
+  //    "JBO24" → "JBO 24",  "WE015" → "WE 015"
+  const split=q.replace(/\b([A-Za-z]{1,6})(\d{1,6})\b/g,'$1 $2')
+               .replace(/\b(\d{1,6})([A-Za-z]{1,6})\b/g,'$1 $2');
+  if(split!==q) vars.add(split);
+
+  // 3. Dash variants: add/remove dashes between letter and digit parts
+  //    "NM 21008" → "NM-21008",  "JBO24" → "JBO-24"
+  const dashed=q.replace(/\b([A-Za-z]{1,6})\s*(\d{1,6})\b/g,'$1-$2');
+  if(dashed!==q) vars.add(dashed);
+  const undashed=q.replace(/\b([A-Za-z]{1,6})-(\d{1,6})\b/g,'$1$2')
+                  .replace(/\b([A-Za-z]{1,6})-(\d{1,6})\b/g,'$1 $2');
+  if(undashed!==q) vars.add(undashed);
+
+  // 4. Uppercase all letter parts (cat#s are always uppercase on Discogs)
+  const upped=q.replace(/\b([A-Za-z]{1,6})(\s*[-\s]?\s*)(\d{1,6})\b/g,
+    (m,l,sep,n)=>l.toUpperCase()+sep+n);
+  if(upped!==q) vars.add(upped);
+
+  return [...vars];
 }
 
 const Voice=(()=>{
@@ -1299,23 +1418,39 @@ const App={
   // Score by exact letter-match across all fields equally — artist/title/label/year/country
   // Pure character overlap: how many query chars appear in the result, field doesn't matter
   scoreResult(r, q){
-    const qClean=q.toLowerCase().replace(/[^a-z0-9\s]/g,'');
-    const qWords=qClean.split(/\s+/).filter(w=>w.length>1);
-    const haystack=`${r.title||''} ${(r.label||[]).join(' ')} ${r.catno||''} ${r.country||''} ${r.year||''}`.toLowerCase().replace(/[^a-z0-9\s]/g,'');
-    let score=0;
-    const hay=[...haystack];
-    // Score each query character found anywhere in the full result string
-    for(const ch of qClean.replace(/\s/g,'')){
-      const idx=hay.indexOf(ch);
-      if(idx!==-1){score++;hay.splice(idx,1);}
+    const qClean=q.toLowerCase().replace(/[^a-z0-9\s]/g,'').trim();
+    const qWords=qClean.split(/\s+/).filter(w=>w.length>0);
+    // Full haystack includes artist and title
+    const haystack=`${r.artist||''} ${r.title||''} ${(r.label||[]).join(' ')} ${r.catno||''} ${r.country||''} ${r.year||''}`.toLowerCase().replace(/[^a-z0-9\s]/g,'');
+    const hWords=haystack.split(/\s+/);
+
+    // PRIMARY: longest consecutive in-order run of query words found in haystack
+    // e.g. "i get my kicks at nighttime" vs qWords=["i","get","my","kicks","at","night","time"]
+    // Try each starting position in haystack, find longest run
+    let bestRun=0;
+    for(let hi=0;hi<hWords.length;hi++){
+      let run=0;
+      let qi=0;
+      for(let h2=hi;h2<hWords.length&&qi<qWords.length;h2++){
+        if(hWords[h2]===qWords[qi]||hWords[h2].includes(qWords[qi])||qWords[qi].includes(hWords[h2])){
+          run++; qi++;
+        } else {
+          break;
+        }
+      }
+      if(run>bestRun) bestRun=run;
     }
-    // Bonus for contiguous word matches (bigrams) regardless of field
-    for(let i=0;i<qClean.length-1;i++){
-      if(haystack.includes(qClean[i]+qClean[i+1])) score+=0.5;
-    }
-    // Bonus: every query word present
-    if(qWords.every(w=>haystack.includes(w))) score+=15;
-    return score;
+
+    // SECONDARY: how many query words appear anywhere (order-independent)
+    const anywhereCount=qWords.filter(w=>haystack.includes(w)).length;
+
+    // Cat# exact match bonus
+    const catno=(r.catno||'').toLowerCase().replace(/[-\s]/g,'');
+    const qCat=qClean.replace(/\s/g,'');
+    const catBonus=(catno&&(qCat.includes(catno)||catno.includes(qCat)))?50:0;
+
+    // Score: consecutive run weighted heavily, then anywhere count, then cat# bonus
+    return (bestRun*20) + (anywhereCount*3) + catBonus;
   },
 
   cancelSearch(){
@@ -1338,7 +1473,7 @@ const App={
     const v = val.toLowerCase();
     const words = v.split(/\s+/);
     const filtered = this.cache.filter(r=>{
-      const h = `${r.title||''} ${(r.label||[]).join(' ')} ${r.catno||''} ${r.country||''} ${r.year||''}`.toLowerCase();
+      const h = `${r.artist||''} ${r.title||''} ${(r.label||[]).join(' ')} ${r.catno||''} ${r.country||''} ${r.year||''}`.toLowerCase();
       return words.every(w=>h.includes(w));
     });
     filtered.sort((a,b)=>this.scoreResult(b,val)-this.scoreResult(a,val));
