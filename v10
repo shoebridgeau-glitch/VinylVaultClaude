@@ -86,6 +86,19 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--s
 .disc.on{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+/* Search progress popup */
+#srch-progress{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--s2);border:1px solid var(--border);border-radius:12px;padding:12px 18px;min-width:260px;max-width:90vw;z-index:999;display:none;box-shadow:0 4px 24px rgba(0,0,0,.6)}
+#srch-progress.on{display:block}
+.sp-step{font-size:12px;font-family:var(--mono);color:var(--t2);padding:3px 0;display:flex;align-items:center;gap:8px;transition:color .2s}
+.sp-step.active{color:var(--text)}
+.sp-step.done{color:var(--green)}
+.sp-step.done::before{content:'✓ '}
+.sp-step.active::before{content:'→ '}
+.sp-dot{width:6px;height:6px;border-radius:50%;background:var(--border);flex-shrink:0}
+.sp-step.active .sp-dot{background:var(--red);animation:pulse .8s ease-in-out infinite}
+.sp-step.done .sp-dot{background:var(--green)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
 /* Stats bar */
 .stats{display:flex;border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:20px}
 .stat{flex:1;padding:13px 10px;text-align:center;border-right:1px solid var(--border)}
@@ -425,6 +438,13 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9998;o
   </div>
 </div>
 
+<!-- SEARCH PROGRESS -->
+<div id="srch-progress">
+  <div class="sp-step" id="sp-1"><span class="sp-dot"></span><span class="sp-txt">Exact match…</span></div>
+  <div class="sp-step" id="sp-2"><span class="sp-dot"></span><span class="sp-txt">Trying variants…</span></div>
+  <div class="sp-step" id="sp-3"><span class="sp-dot"></span><span class="sp-txt">Word combinations…</span></div>
+</div>
+
 <!-- TOAST -->
 <div class="toast" id="toast"></div>
 
@@ -582,8 +602,10 @@ const Discogs=(()=>{
     searchArtist:artist=>get(`/database/search?artist=${encodeURIComponent(artist)}&type=release&per_page=25&format=vinyl`).then(d=>d.results||[]),
     stats:id=>get(`/marketplace/stats/${id}`).catch(()=>null),
     searchWithFallback:async q=>{
-      // Round 1: full query + all ingVariants (ING↔IN' + word-ending swaps)
-      // q= searches ALL Discogs fields: artist, title, label, tracklist, cat#
+      progShow();
+
+      // Round 1: exact + ING/ending/join variants
+      progStep(1,`Searching "${q}"…`);
       const queries=ingVariants(q);
       for(const variant of queries){
         const words=variant.trim().split(/\s+/);
@@ -594,13 +616,22 @@ const Discogs=(()=>{
         for(const sp of splits){
           const p=`/database/search?artist=${encodeURIComponent(sp.artist)}&release_title=${encodeURIComponent(sp.title)}&type=release&per_page=15&format=vinyl`;
           const r=await get(p).then(d=>d.results||[]).catch(()=>[]);
-          if(r.length) return {results:r, usedQuery: variant===q?null:variant};
+          if(r.length){progHide();return {results:r, usedQuery: variant===q?null:variant};}
         }
         const r=await get(`/database/search?q=${encodeURIComponent(variant)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
-        if(r.length) return {results:r, usedQuery: variant===q?null:variant};
+        if(r.length){progHide();return {results:r, usedQuery: variant===q?null:variant};}
       }
 
-      // Round 2: 2-word combinations — catches partial matches like label+artist
+      // Round 2: word-split variants ("bogeyman" → "bogey man")
+      progStep(2,'Trying word splits…');
+      const splitVars=wordSplitVariants(q);
+      for(const sv of splitVars){
+        const r=await get(`/database/search?q=${encodeURIComponent(sv)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
+        if(r.length){progHide();return {results:r, usedQuery:sv};}
+      }
+
+      // Round 3: 2-word combinations
+      progStep(3,'Trying word pairs…');
       const words=q.trim().split(/\s+/).filter(w=>w.length>2);
       const seen=new Set();
       for(let i=0;i<words.length;i++){
@@ -608,9 +639,11 @@ const Discogs=(()=>{
           const pair=`${words[i]} ${words[j]}`;
           if(seen.has(pair)) continue; seen.add(pair);
           const r=await get(`/database/search?q=${encodeURIComponent(pair)}&type=release&per_page=15&format=vinyl`).then(d=>d.results||[]).catch(()=>[]);
-          if(r.length) return {results:r, usedQuery:pair};
+          if(r.length){progHide();return {results:r, usedQuery:pair};}
         }
       }
+
+      progHide();
       return {results:[], usedQuery:null};
     },
     fmt:(v,c)=>{
@@ -681,7 +714,60 @@ function auClean(t){
   return s.trim();
 }
 
-// ── Word variants: ING contractions + ending swaps + word joins ────────────
+// ── Search progress popup ─────────────────────────────────────────────────
+let _progTimer=null;
+function progShow(){
+  document.getElementById('srch-progress').classList.add('on');
+  ['sp-1','sp-2','sp-3'].forEach(id=>{
+    const el=document.getElementById(id);
+    el.className='sp-step';
+  });
+}
+function progStep(n,label){
+  // Mark previous steps done
+  for(let i=1;i<n;i++){
+    const el=document.getElementById(`sp-${i}`);
+    if(el) el.className='sp-step done';
+  }
+  const el=document.getElementById(`sp-${n}`);
+  if(el){
+    el.className='sp-step active';
+    if(label) el.querySelector('.sp-txt').textContent=label;
+  }
+}
+function progHide(){
+  clearTimeout(_progTimer);
+  _progTimer=setTimeout(()=>{
+    document.getElementById('srch-progress').classList.remove('on');
+    ['sp-1','sp-2','sp-3'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.className='sp-step';
+    });
+  },600);
+}
+
+// ── Word splitter ────────────────────────────────────────────────────────
+// "bogeyman" → tries "bogey man", "boge yman", etc.
+// Only splits words 7+ chars; tries common vowel-boundary splits
+function wordSplitVariants(q){
+  const vars=new Set();
+  const words=q.trim().split(/\s+/);
+  for(let wi=0;wi<words.length;wi++){
+    const w=words[wi].toLowerCase();
+    if(w.length<7) continue;
+    // Try every split position from 3 to len-3
+    for(let pos=3;pos<=w.length-3;pos++){
+      const a=w.slice(0,pos), b=w.slice(pos);
+      // Only split at vowel boundaries or common consonant clusters
+      if(/[aeiou]$/.test(a)||/^[aeiou]/.test(b)||/[aeiou]{2}/.test(a+b)){
+        const attempt=[...words];
+        attempt.splice(wi,1,a,b);
+        vars.add(attempt.join(' '));
+      }
+    }
+  }
+  return [...vars];
+}
 // Covers: livin'/living, twisted/twister, dragon/dragoon,
 // AND "kit builders" → "kitbuilders" for compound artist/label names
 const ENDING_SWAPS=[
